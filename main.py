@@ -15,7 +15,6 @@ import requests
 from datetime import datetime
 import boto3
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
 
 
 # Supabase configuration
@@ -24,7 +23,6 @@ SUPABASE_KEY = os.getenv(
     "SUPABASE_ANON_KEY",
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhmY2R1YWFsYWxmcHBqZm9xd2tlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTE4ODg3NjQsImV4cCI6MjA2NzQ2NDc2NH0.f5wyoVkiqO163JRPzjnPn9R3jN-gzqss1PZSJ6PRa2U",
 )
-ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY", "H3DAAKW7uGI2-8nEl6c0H")
 
 # SNS Configuration
 SNS_TOPIC_ARN = os.getenv(
@@ -42,31 +40,12 @@ ALLIUM_HEADERS = {"Content-Type": "application/json", "X-API-KEY": ALLIUM_API_KE
 # Initialize SNS client
 sns_client = boto3.client("sns", region_name="us-east-1")
 
-# Cache for wallet addresses (set of known wallet addresses)
-_wallet_cache: Set[str] = set()
-# Cache for contract addresses (set of known contract addresses)
-_contract_cache: Set[str] = set()
-_cache_lock = threading.Lock()  # Thread-safe access to caches
-
-# Cache of all encountered addresses (for estimating API calls)
-_addresses_seen: Set[str] = set()
-
-# Alchemy API call counter
-_alchemy_call_count = 0
-_alchemy_counter_lock = threading.Lock()  # Thread-safe access to counter
-
 
 def get_all_wallets(supabase: Client) -> List[str]:
-    """Fetch all wallet IDs from Supabase and update wallet cache"""
+    """Fetch all wallet IDs from Supabase"""
     try:
         response = supabase.table("wallet").select("wallet_id").execute()
         wallets = [row["wallet_id"] for row in response.data]
-
-        # Add all wallets to cache (addresses are already normalized with 0x)
-        with _cache_lock:
-            for wallet in wallets:
-                _wallet_cache.add(wallet.lower())
-
         return wallets
     except Exception as e:
         print(f"❌ Error fetching wallets: {e}")
@@ -138,13 +117,14 @@ def get_all_wallet_transactions(
     return all_transactions
 
 
-def is_contract_address(address: str) -> Tuple[bool, str]:
+def is_contract_address(address: str, wallets_set: Set[str]) -> Tuple[bool, str]:
     """
-    Check if an address is a contract address using cache first, then Alchemy API.
-    Thread-safe version.
+    Check if an address is a contract address using wallets from Supabase.
+    If address is in wallets set, it's a wallet; otherwise, it's a contract.
 
     Args:
         address: The address to check (already has 0x prefix)
+        wallets_set: Set of wallet addresses from Supabase (lowercase normalized)
 
     Returns:
         tuple: (is_contract: bool, wallet_address: str or empty string)
@@ -154,102 +134,38 @@ def is_contract_address(address: str) -> Tuple[bool, str]:
     # Addresses are already normalized (0x prefix), just make lowercase
     normalized_addr = address.lower()
 
-    # Track every encountered address and print the total unique count
-    with _cache_lock:
-        _addresses_seen.add(normalized_addr)
-        print(f"📦 Addresses encountered (unique): {len(_addresses_seen)}")
-
-    # Check caches first (thread-safe read)
-    with _cache_lock:
-        in_wallet_cache = normalized_addr in _wallet_cache
-        in_contract_cache = normalized_addr in _contract_cache
-
-    if in_wallet_cache:
+    # Check if address is in wallets set
+    # If it's in the wallets set, it's a wallet; otherwise, treat as contract
+    if normalized_addr in wallets_set:
         # It's a wallet
         wallet_address = address
         return False, wallet_address
-
-    if in_contract_cache:
-        # It's a contract
-        return True, ""
-
-    # Not in either cache, make API call
-    # Increment counter (thread-safe)
-    with _alchemy_counter_lock:
-        global _alchemy_call_count
-        _alchemy_call_count += 1
-        call_number = _alchemy_call_count
-
-    return True, ""
-    print(f"📞 Alchemy API calls so far: {call_number}")
-
-    rpc_url = f"https://base-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
-
-    headers = {"Content-Type": "application/json"}
-    payload = {
-        "jsonrpc": "2.0",
-        "method": "eth_getCode",
-        "params": [address, "latest"],  # Check latest block
-        "id": 1,
-    }
-
-    try:
-        r = requests.post(rpc_url, headers=headers, json=payload, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-
-        if "error" in data:
-            raise RuntimeError(f"RPC error: {data['error']}")
-
-        result = data.get("result", "")
-
-        # If result is "0x" or empty, it's an EOA (wallet)
-        # If result has bytecode, it's a contract
-        is_contract = result != "0x" and result != ""
-
-        # Add to appropriate cache (thread-safe write)
-        with _cache_lock:
-            if is_contract:
-                _contract_cache.add(normalized_addr)
-            else:
-                _wallet_cache.add(normalized_addr)
-
-        wallet_address = address if not is_contract else ""
-        return is_contract, wallet_address
-
-    except Exception as e:
-        print(
-            f"⚠️ Error checking if address {address} is contract (assuming contract): {e}"
-        )
-        # Fallback: assume it's a contract if we can't determine
-        # Don't add to cache, return as contract
+    else:
+        # Not in wallets set, treat as contract
         return True, ""
 
 
-def batch_check_contracts(addresses: List[str]) -> Dict[str, Tuple[bool, str]]:
+def batch_check_contracts(
+    addresses: List[str], wallets_set: Set[str]
+) -> Dict[str, Tuple[bool, str]]:
     """
-    Check multiple addresses concurrently to see if they are contracts.
+    Check multiple addresses to see if they are contracts.
 
     Args:
         addresses: List of addresses to check
+        wallets_set: Set of wallet addresses from Supabase (lowercase normalized)
 
     Returns:
         Dictionary mapping address to (is_contract: bool, wallet_address: str)
     """
     results = {}
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        future_to_addr = {
-            executor.submit(is_contract_address, addr): addr for addr in addresses
-        }
-
-        for future in as_completed(future_to_addr):
-            addr = future_to_addr[future]
-            try:
-                results[addr] = future.result()
-            except Exception as e:
-                print(f"⚠️ Error checking address {addr}: {e}")
-                results[addr] = (True, "")  # Default to contract on error
+    for addr in addresses:
+        try:
+            results[addr] = is_contract_address(addr, wallets_set)
+        except Exception as e:
+            print(f"⚠️ Error checking address {addr}: {e}")
+            results[addr] = (True, "")  # Default to contract on error
 
     return results
 
@@ -298,8 +214,6 @@ def extract_native_transfers(
                     "from_address": from_address,
                     "to_address": to_address,
                     "amount": transfer.get("amount", {}).get("raw_amount"),
-                    "is_from_contract_address": from_is_contract,
-                    "is_to_contract_address": to_is_contract,
                 }
             )
 
@@ -319,7 +233,7 @@ def extract_native_transfers(
 
 
 def filter_and_transform_native_transfers(
-    transactions: List[Dict], api_request_time: str
+    transactions: List[Dict], api_request_time: str, wallets_set: Set[str]
 ) -> List[tuple[Dict, Set[str]]]:
     """Filter and transform transactions to only include those with native transfers.
     Uses batch contract checking for performance.
@@ -327,6 +241,7 @@ def filter_and_transform_native_transfers(
     Args:
         transactions: List of raw transactions from API
         api_request_time: ISO format timestamp when API request was made
+        wallets_set: Set of wallet addresses from Supabase (lowercase normalized)
 
     Returns:
         List of tuples: (formatted_transaction, wallet_addresses)
@@ -345,14 +260,8 @@ def filter_and_transform_native_transfers(
                 if to_address:
                     unique_addresses.add(to_address)
 
-    # Track addresses encountered (new or duplicate) and print size
-    with _cache_lock:
-        for addr in unique_addresses:
-            _addresses_seen.add(addr.lower())
-        print(f"📦 Addresses encountered (unique): {len(_addresses_seen)}")
-
     # Batch check all addresses concurrently
-    contract_results = batch_check_contracts(list(unique_addresses))
+    contract_results = batch_check_contracts(list(unique_addresses), wallets_set)
 
     # Now process transactions with pre-computed contract results
     native_transfer_transactions = []
@@ -429,6 +338,9 @@ def main():
             else:
                 print(f"🔍 Processing {len(wallets)} wallet(s)")
 
+                # Convert wallets list to normalized set (lowercase) for efficient lookup
+                wallets_set = {wallet.lower() for wallet in wallets}
+
                 # Fetch all transactions for these wallets
                 all_transactions = get_all_wallet_transactions(wallets)
 
@@ -436,7 +348,7 @@ def main():
                 if all_transactions:
                     native_transfer_transactions = (
                         filter_and_transform_native_transfers(
-                            all_transactions, api_request_time
+                            all_transactions, api_request_time, wallets_set
                         )
                     )
 
