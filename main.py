@@ -15,6 +15,7 @@ import requests
 from datetime import datetime
 import boto3
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from logger import logger
 
 
 # Supabase configuration
@@ -48,7 +49,7 @@ def get_all_wallets(supabase: Client) -> List[str]:
         wallets = [row["wallet_id"] for row in response.data]
         return wallets
     except Exception as e:
-        print(f"❌ Error fetching wallets: {e}")
+        logger.error("Error fetching wallets", extra={"error": str(e)})
         return []
 
 
@@ -78,10 +79,11 @@ def get_wallet_transactions_page(
         return response.json()
 
     except requests.exceptions.RequestException as e:
-        print(f"❌ Error making API request: {e}")
+        extra_data = {"error": str(e)}
         if hasattr(e, "response") and e.response is not None:
-            print(f"Response status: {e.response.status_code}")
-            print(f"Response content: {e.response.text}")
+            extra_data["response_status"] = e.response.status_code
+            extra_data["response_content"] = e.response.text
+        logger.error("Error making API request", extra=extra_data)
         raise
 
 
@@ -103,17 +105,22 @@ def get_all_wallet_transactions(
         if "items" in results and results["items"]:
             all_transactions.extend(results["items"])
         else:
-            print(f"  ℹ️ No transactions found on this page")
+            logger.info(
+                "No transactions found on this page", extra={"page": page_count}
+            )
             break
 
         # Check if there's a cursor for the next page
         if "cursor" in results and results["cursor"]:
             cursor = results["cursor"]
         else:
-            print(f"  ✓ No more pages available")
+            logger.info("No more pages available", extra={"page": page_count})
             break
 
-    print(f"\n🎉 Completed! Total transactions fetched: {len(all_transactions)}")
+    logger.info(
+        "Completed fetching transactions",
+        extra={"total_transactions": len(all_transactions)},
+    )
     return all_transactions
 
 
@@ -164,7 +171,9 @@ def batch_check_contracts(
         try:
             results[addr] = is_contract_address(addr, wallets_set)
         except Exception as e:
-            print(f"⚠️ Error checking address {addr}: {e}")
+            logger.warning(
+                "Error checking address", extra={"address": addr, "error": str(e)}
+            )
             results[addr] = (True, "")  # Default to contract on error
 
     return results
@@ -300,19 +309,23 @@ def publish_to_sns(transaction: Dict, wallet_addresses: Set[str]) -> None:
         )
 
     except Exception as e:
-        print(f"❌ Error publishing to SNS: {e}")
+        logger.error(
+            "Error publishing to SNS",
+            extra={"error": str(e), "transaction_hash": transaction.get("hash")},
+        )
         raise
 
 
 def main():
     """Main function - Fetches wallet transactions every minute"""
-    print("🚀 Graph AI Wallet Native Transfer Ingestion Service")
-    print("=" * 60)
-    print(f"Python version: {sys.version}")
+    logger.info(
+        "Graph AI Wallet Native Transfer Ingestion Service starting",
+        extra={"python_version": sys.version},
+    )
 
     # Initialize Supabase client
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    print("✅ Supabase client initialized")
+    logger.info("Supabase client initialized")
 
     # Main service loop
     try:
@@ -323,9 +336,10 @@ def main():
             current_time = time.strftime("%Y-%m-%d %H:%M:%S")
             timestamp_safe = current_time.replace(" ", "_").replace(":", "-")
 
-            print(f"\n{'='*60}")
-            print(f"⏰ Iteration #{iteration} - {current_time}")
-            print(f"{'='*60}")
+            logger.info(
+                "Starting iteration",
+                extra={"iteration": iteration, "timestamp": current_time},
+            )
 
             # Get API request time before fetching wallets
             api_request_time = datetime.now().isoformat()
@@ -334,9 +348,9 @@ def main():
             wallets = get_all_wallets(supabase)
 
             if not wallets:
-                print("⚠️ No wallets found in database. Skipping...")
+                logger.warning("No wallets found in database. Skipping...")
             else:
-                print(f"🔍 Processing {len(wallets)} wallet(s)")
+                logger.info("Processing wallets", extra={"wallet_count": len(wallets)})
 
                 # Convert wallets list to normalized set (lowercase) for efficient lookup
                 wallets_set = {wallet.lower() for wallet in wallets}
@@ -370,25 +384,39 @@ def main():
                                 try:
                                     future.result()
                                 except Exception as e:
-                                    print(f"❌ Error in parallel SNS publish: {e}")
+                                    logger.error(
+                                        "Error in parallel SNS publish",
+                                        extra={"error": str(e)},
+                                    )
 
-                        print(
-                            f"✅ Successfully published all {len(native_transfer_transactions)} transactions to SNS"
+                        logger.info(
+                            "Successfully published all transactions to SNS",
+                            extra={
+                                "transaction_count": len(native_transfer_transactions)
+                            },
                         )
                     else:
-                        print("ℹ️ No transactions with native transfers found, skipping")
+                        logger.info(
+                            "No transactions with native transfers found, skipping"
+                        )
                 else:
-                    print("ℹ️ No transactions found")
+                    logger.info("No transactions found")
 
             loop_end_time = time.time()
             loop_duration = loop_end_time - loop_start_time
-            print(f"\n⏱️ Loop processing time: {loop_duration:.2f} seconds")
-            print(f"💤 Sleeping for 1 minute...")
+            logger.info(
+                "Loop processing complete",
+                extra={
+                    "duration_seconds": round(loop_duration, 2),
+                    "iteration": iteration,
+                },
+            )
+            logger.info("Sleeping for 1 minute before next iteration")
             time.sleep(60)  # Wait 1 minute before next iteration
 
     except KeyboardInterrupt:
-        print("\n\n🛑 Shutting down...")
-        print("✅ Service shutdown complete")
+        logger.info("Shutting down service")
+        logger.info("Service shutdown complete")
 
 
 if __name__ == "__main__":
