@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Set, Tuple
 from supabase import create_client, Client
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import boto3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from logger import logger
@@ -41,6 +41,111 @@ ALLIUM_HEADERS = {"Content-Type": "application/json", "X-API-KEY": ALLIUM_API_KE
 # Initialize SNS client
 sns_client = boto3.client("sns", region_name="us-east-1")
 
+# Table name for storing the last processed timestamp
+TIMESTAMP_TABLE_NAME = "native_transfer_fetcher_pipeline_timestamp"
+
+
+def parse_allium_timestamp(block_timestamp) -> Optional[datetime]:
+    """
+    Parse Allium API block_timestamp to datetime object.
+    Allium returns timestamps in format: "2025-02-04T16:45:27" (ISO format without timezone).
+
+    Args:
+        block_timestamp: Timestamp from Allium API (string in ISO format)
+
+    Returns:
+        datetime object with UTC timezone, or None if parsing fails
+    """
+    if not block_timestamp:
+        return None
+
+    try:
+        if isinstance(block_timestamp, str):
+            # Allium format: "2025-02-04T16:45:27" (no timezone, assume UTC)
+            # Parse as naive datetime and add UTC timezone
+            dt = datetime.fromisoformat(block_timestamp)
+            # If no timezone info, assume UTC
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        elif isinstance(block_timestamp, (int, float)):
+            # Unix timestamp
+            return datetime.fromtimestamp(block_timestamp, tz=timezone.utc)
+        else:
+            return None
+    except Exception as e:
+        logger.warning(
+            "Error parsing Allium timestamp",
+            extra={"error": str(e), "block_timestamp": block_timestamp},
+        )
+        return None
+
+
+def get_last_processed_timestamp(supabase: Client) -> Optional[datetime]:
+    """
+    Get the last processed timestamp from Supabase.
+    Returns None if no timestamp exists (first run).
+
+    Args:
+        supabase: Supabase client instance
+
+    Returns:
+        datetime object representing the last processed timestamp, or None
+    """
+    try:
+        response = (
+            supabase.table(TIMESTAMP_TABLE_NAME).select("timestamp").limit(1).execute()
+        )
+
+        if response.data and len(response.data) > 0:
+            timestamp_str = response.data[0].get("timestamp")
+            if timestamp_str:
+                # Parse ISO format timestamp
+                return datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+
+        return None
+    except Exception as e:
+        logger.warning(
+            "Error fetching last processed timestamp, assuming first run",
+            extra={"error": str(e)},
+        )
+        return None
+
+
+def update_last_processed_timestamp(supabase: Client, timestamp: datetime) -> None:
+    """
+    Update the last processed timestamp in Supabase.
+    For a single-row table, deletes all rows and inserts the new timestamp.
+
+    Args:
+        supabase: Supabase client instance
+        timestamp: datetime object representing the latest processed timestamp
+    """
+    try:
+        # Convert to ISO format string with timezone
+        timestamp_iso = timestamp.isoformat()
+
+        # For single-row table: delete all existing records and insert new one
+        # This ensures we always have exactly one record
+        # Delete all rows (using a condition that matches all)
+        supabase.table(TIMESTAMP_TABLE_NAME).delete().gte(
+            "timestamp", "1970-01-01T00:00:00+00:00"
+        ).execute()
+        # Insert new record
+        supabase.table(TIMESTAMP_TABLE_NAME).insert(
+            {"timestamp": timestamp_iso}
+        ).execute()
+        logger.info(
+            "Updated last processed timestamp", extra={"timestamp": timestamp_iso}
+        )
+
+    except Exception as e:
+        logger.error(
+            "Error updating last processed timestamp",
+            extra={"error": str(e), "timestamp": timestamp.isoformat()},
+        )
+        raise
+
 
 def get_all_wallets(supabase: Client) -> List[str]:
     """Fetch all wallet IDs from Supabase"""
@@ -54,10 +159,21 @@ def get_all_wallets(supabase: Client) -> List[str]:
 
 
 def get_wallet_transactions_page(
-    addresses: List[str], chain: str = "base", cursor: str = None
+    addresses: List[str],
+    chain: str = "base",
+    cursor: str = None,
+    lookback_days: Optional[int] = None,
 ) -> Dict:
-    """Fetch one page of wallet transactions from Allium API"""
+    """
+    Fetch one page of wallet transactions from Allium API.
 
+    Args:
+        addresses: List of wallet addresses
+        chain: Blockchain chain (default: "base")
+        cursor: Pagination cursor
+        lookback_days: Optional number of days to look back (default: None, fetches since genesis)
+                       According to Allium API docs: https://docs.allium.so/api/developer/wallets/transactions#parameter-lookback-days
+    """
     # Prepare request body with all addresses
     payload = [{"chain": chain, "address": addr} for addr in addresses]
 
@@ -65,6 +181,10 @@ def get_wallet_transactions_page(
     params = {"limit": 1000}
     if cursor:
         params["cursor"] = cursor
+
+    # Add lookback_days parameter if provided (for last day data)
+    if lookback_days is not None:
+        params["lookback_days"] = lookback_days
 
     try:
         response = requests.post(
@@ -88,9 +208,17 @@ def get_wallet_transactions_page(
 
 
 def get_all_wallet_transactions(
-    addresses: List[str], chain: str = "base"
+    addresses: List[str], chain: str = "base", lookback_days: Optional[int] = None
 ) -> List[Dict]:
-    """Fetch ALL wallet transactions using pagination"""
+    """
+    Fetch wallet transactions using pagination, filtered by lookback_days if provided.
+
+    Args:
+        addresses: List of wallet addresses
+        chain: Blockchain chain (default: "base")
+        lookback_days: Optional number of days to look back (default: None, fetches since genesis)
+                       Set to 1 to fetch only last day data
+    """
     all_transactions = []
     cursor = None
     page_count = 0
@@ -98,8 +226,8 @@ def get_all_wallet_transactions(
     while True:
         page_count += 1
 
-        # Get one page of results
-        results = get_wallet_transactions_page(addresses, chain, cursor)
+        # Get one page of results with lookback_days filtering
+        results = get_wallet_transactions_page(addresses, chain, cursor, lookback_days)
 
         # Add transactions from this page to our collection
         if "items" in results and results["items"]:
@@ -119,7 +247,10 @@ def get_all_wallet_transactions(
 
     logger.info(
         "Completed fetching transactions",
-        extra={"total_transactions": len(all_transactions)},
+        extra={
+            "total_transactions": len(all_transactions),
+            "lookback_days": lookback_days,
+        },
     )
     return all_transactions
 
@@ -242,22 +373,59 @@ def extract_native_transfers(
 
 
 def filter_and_transform_native_transfers(
-    transactions: List[Dict], api_request_time: str, wallets_set: Set[str]
-) -> List[tuple[Dict, Set[str]]]:
-    """Filter and transform transactions to only include those with native transfers.
+    transactions: List[Dict],
+    api_request_time: str,
+    wallets_set: Set[str],
+    last_processed_timestamp: Optional[datetime] = None,
+) -> Tuple[List[tuple[Dict, Set[str]]], Optional[datetime]]:
+    """
+    Filter and transform transactions to only include those with native transfers.
     Uses batch contract checking for performance.
+    Only processes transactions after the last processed timestamp.
 
     Args:
         transactions: List of raw transactions from API
         api_request_time: ISO format timestamp when API request was made
         wallets_set: Set of wallet addresses from Supabase (lowercase normalized)
+        last_processed_timestamp: Timestamp to filter transactions (only process after this)
 
     Returns:
-        List of tuples: (formatted_transaction, wallet_addresses)
+        Tuple of (list of tuples: (formatted_transaction, wallet_addresses), latest_timestamp)
     """
-    # First, collect all unique addresses from all transactions
+    # Filter transactions by timestamp if last_processed_timestamp is provided
+    filtered_transactions = []
+    if last_processed_timestamp:
+        for transaction in transactions:
+            block_timestamp = transaction.get("block_timestamp")
+            tx_timestamp = parse_allium_timestamp(block_timestamp)
+
+            if tx_timestamp:
+                # Only include transactions after the last processed timestamp
+                if tx_timestamp > last_processed_timestamp:
+                    filtered_transactions.append(transaction)
+            else:
+                # Include transactions without valid timestamp (to be safe)
+                filtered_transactions.append(transaction)
+    else:
+        # No timestamp filter, process all transactions
+        filtered_transactions = transactions
+
+    logger.info(
+        "Filtered transactions by timestamp",
+        extra={
+            "original_count": len(transactions),
+            "filtered_count": len(filtered_transactions),
+            "last_processed_timestamp": (
+                last_processed_timestamp.isoformat()
+                if last_processed_timestamp
+                else None
+            ),
+        },
+    )
+
+    # First, collect all unique addresses from all filtered transactions
     unique_addresses = set()
-    for transaction in transactions:
+    for transaction in filtered_transactions:
         asset_transfers = transaction.get("asset_transfers", [])
         for transfer in asset_transfers:
             asset = transfer.get("asset", {})
@@ -274,14 +442,24 @@ def filter_and_transform_native_transfers(
 
     # Now process transactions with pre-computed contract results
     native_transfer_transactions = []
-    for transaction in transactions:
+    latest_timestamp = last_processed_timestamp
+
+    for transaction in filtered_transactions:
         formatted, wallet_addresses = extract_native_transfers(
             transaction, api_request_time, contract_results
         )
         if formatted:
             native_transfer_transactions.append((formatted, wallet_addresses))
 
-    return native_transfer_transactions
+            # Update latest timestamp if this transaction is newer
+            block_timestamp = transaction.get("block_timestamp")
+            tx_timestamp = parse_allium_timestamp(block_timestamp)
+
+            if tx_timestamp:
+                if latest_timestamp is None or tx_timestamp > latest_timestamp:
+                    latest_timestamp = tx_timestamp
+
+    return native_transfer_transactions, latest_timestamp
 
 
 def publish_to_sns(transaction: Dict, wallet_addresses: Set[str]) -> None:
@@ -344,6 +522,16 @@ def main():
             # Get API request time before fetching wallets
             api_request_time = datetime.now().isoformat()
 
+            # Get last processed timestamp from Supabase
+            last_processed_timestamp = get_last_processed_timestamp(supabase)
+            if last_processed_timestamp:
+                logger.info(
+                    "Retrieved last processed timestamp",
+                    extra={"timestamp": last_processed_timestamp.isoformat()},
+                )
+            else:
+                logger.info("No previous timestamp found, processing from beginning")
+
             # Fetch all wallets from Supabase
             wallets = get_all_wallets(supabase)
 
@@ -355,14 +543,18 @@ def main():
                 # Convert wallets list to normalized set (lowercase) for efficient lookup
                 wallets_set = {wallet.lower() for wallet in wallets}
 
-                # Fetch all transactions for these wallets
-                all_transactions = get_all_wallet_transactions(wallets)
+                # Fetch transactions for last day only using lookback_days=1
+                # According to Allium API: https://docs.allium.so/api/developer/wallets/transactions#parameter-lookback-days
+                all_transactions = get_all_wallet_transactions(wallets, lookback_days=1)
 
-                # Filter and transform to only include native transfers
+                # Filter and transform to only include native transfers after last processed timestamp
                 if all_transactions:
-                    native_transfer_transactions = (
+                    native_transfer_transactions, latest_timestamp = (
                         filter_and_transform_native_transfers(
-                            all_transactions, api_request_time, wallets_set
+                            all_transactions,
+                            api_request_time,
+                            wallets_set,
+                            last_processed_timestamp,
                         )
                     )
 
@@ -395,6 +587,14 @@ def main():
                                 "transaction_count": len(native_transfer_transactions)
                             },
                         )
+
+                        # Update the last processed timestamp with the latest native transfer timestamp
+                        if latest_timestamp:
+                            update_last_processed_timestamp(supabase, latest_timestamp)
+                            logger.info(
+                                "Updated last processed timestamp",
+                                extra={"timestamp": latest_timestamp.isoformat()},
+                            )
                     else:
                         logger.info(
                             "No transactions with native transfers found, skipping"
