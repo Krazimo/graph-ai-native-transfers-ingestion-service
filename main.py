@@ -163,9 +163,11 @@ def get_wallet_transactions_page(
     chain: str = "base",
     cursor: str = None,
     lookback_days: Optional[int] = None,
+    max_retries: int = 3,
+    retry_delay: int = 5,
 ) -> Dict:
     """
-    Fetch one page of wallet transactions from Allium API.
+    Fetch one page of wallet transactions from Allium API with retry logic.
 
     Args:
         addresses: List of wallet addresses
@@ -173,6 +175,8 @@ def get_wallet_transactions_page(
         cursor: Pagination cursor
         lookback_days: Optional number of days to look back (default: None, fetches since genesis)
                        According to Allium API docs: https://docs.allium.so/api/developer/wallets/transactions#parameter-lookback-days
+        max_retries: Maximum number of retry attempts (default: 3)
+        retry_delay: Delay in seconds between retries (default: 5)
     """
     # Prepare request body with all addresses
     payload = [{"chain": chain, "address": addr} for addr in addresses]
@@ -186,25 +190,53 @@ def get_wallet_transactions_page(
     if lookback_days is not None:
         params["lookback_days"] = lookback_days
 
-    try:
-        response = requests.post(
-            ALLIUM_BASE_URL,
-            headers=ALLIUM_HEADERS,
-            params=params,
-            json=payload,
-            timeout=30,
-        )
+    # Retry logic for handling timeouts and transient errors
+    for attempt in range(max_retries):
+        try:
+            # Increase timeout for large requests (60 seconds for read, 10 seconds for connect)
+            response = requests.post(
+                ALLIUM_BASE_URL,
+                headers=ALLIUM_HEADERS,
+                params=params,
+                json=payload,
+                timeout=(10, 60),  # (connect_timeout, read_timeout)
+            )
 
-        response.raise_for_status()
-        return response.json()
+            response.raise_for_status()
+            return response.json()
 
-    except requests.exceptions.RequestException as e:
-        extra_data = {"error": str(e)}
-        if hasattr(e, "response") and e.response is not None:
-            extra_data["response_status"] = e.response.status_code
-            extra_data["response_content"] = e.response.text
-        logger.error("Error making API request", extra=extra_data)
-        raise
+        except requests.exceptions.Timeout as e:
+            if attempt < max_retries - 1:
+                logger.warning(
+                    f"API request timed out (attempt {attempt + 1}/{max_retries}), retrying in {retry_delay} seconds...",
+                    extra={"error": str(e), "attempt": attempt + 1},
+                )
+                time.sleep(retry_delay)
+                continue
+            else:
+                extra_data = {"error": str(e), "attempt": attempt + 1}
+                logger.error(
+                    "API request timed out after all retries", extra=extra_data
+                )
+                raise
+
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries - 1:
+                logger.warning(
+                    f"API request failed (attempt {attempt + 1}/{max_retries}), retrying in {retry_delay} seconds...",
+                    extra={"error": str(e), "attempt": attempt + 1},
+                )
+                time.sleep(retry_delay)
+                continue
+            else:
+                extra_data = {"error": str(e)}
+                if hasattr(e, "response") and e.response is not None:
+                    extra_data["response_status"] = e.response.status_code
+                    extra_data["response_content"] = e.response.text
+                logger.error(
+                    "Error making API request after all retries", extra=extra_data
+                )
+                raise
 
 
 def get_all_wallet_transactions(
@@ -451,13 +483,14 @@ def filter_and_transform_native_transfers(
         if formatted:
             native_transfer_transactions.append((formatted, wallet_addresses))
 
-            # Update latest timestamp if this transaction is newer
-            block_timestamp = transaction.get("block_timestamp")
-            tx_timestamp = parse_allium_timestamp(block_timestamp)
+        # Update latest timestamp for ALL processed transactions (not just those with native transfers)
+        # This ensures we don't reprocess the same transactions when no native transfers are found
+        block_timestamp = transaction.get("block_timestamp")
+        tx_timestamp = parse_allium_timestamp(block_timestamp)
 
-            if tx_timestamp:
-                if latest_timestamp is None or tx_timestamp > latest_timestamp:
-                    latest_timestamp = tx_timestamp
+        if tx_timestamp:
+            if latest_timestamp is None or tx_timestamp > latest_timestamp:
+                latest_timestamp = tx_timestamp
 
     return native_transfer_transactions, latest_timestamp
 
@@ -588,16 +621,38 @@ def main():
                             },
                         )
 
-                        # Update the last processed timestamp with the latest native transfer timestamp
-                        if latest_timestamp:
-                            update_last_processed_timestamp(supabase, latest_timestamp)
-                            logger.info(
-                                "Updated last processed timestamp",
-                                extra={"timestamp": latest_timestamp.isoformat()},
-                            )
-                    else:
+                    # Update the last processed timestamp even if no native transfers were found
+                    # This prevents reprocessing the same transactions in the next iteration
+                    if (
+                        latest_timestamp
+                        and latest_timestamp != last_processed_timestamp
+                    ):
+                        update_last_processed_timestamp(supabase, latest_timestamp)
                         logger.info(
-                            "No transactions with native transfers found, skipping"
+                            "Updated last processed timestamp",
+                            extra={
+                                "timestamp": latest_timestamp.isoformat(),
+                                "native_transfers_found": len(
+                                    native_transfer_transactions
+                                )
+                                > 0,
+                            },
+                        )
+                    elif not native_transfer_transactions:
+                        logger.info(
+                            "No transactions with native transfers found",
+                            extra={
+                                "latest_timestamp": (
+                                    latest_timestamp.isoformat()
+                                    if latest_timestamp
+                                    else None
+                                ),
+                                "last_processed_timestamp": (
+                                    last_processed_timestamp.isoformat()
+                                    if last_processed_timestamp
+                                    else None
+                                ),
+                            },
                         )
                 else:
                     logger.info("No transactions found")
