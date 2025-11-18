@@ -8,7 +8,6 @@ import sys
 import json
 import time
 import os
-import math
 from pathlib import Path
 from typing import List, Dict, Optional, Set, Tuple
 from supabase import create_client, Client
@@ -165,66 +164,10 @@ def get_all_wallets(supabase: Client) -> List[str]:
         return []
 
 
-def split_wallets_into_groups(
-    wallets: List[str], max_groups: int = 9
-) -> List[List[str]]:
-    """
-    Split wallets into groups for parallel API calls.
-    Maximum of max_groups groups (default 9) to respect rate limits.
-
-    Args:
-        wallets: List of wallet addresses
-        max_groups: Maximum number of groups (default: 9 for 9 calls/second limit)
-
-    Returns:
-        List of wallet groups
-    """
-    if not wallets:
-        return []
-
-    wallet_count = len(wallets)
-
-    if wallet_count <= max_groups:
-        # If we have fewer wallets than max_groups, create one group per wallet
-        return [[wallet] for wallet in wallets]
-    else:
-        # If we have more wallets, divide into max_groups groups
-        # Calculate wallets per group
-        wallets_per_group = math.ceil(wallet_count / max_groups)
-        groups = []
-
-        for i in range(0, wallet_count, wallets_per_group):
-            group = wallets[i : i + wallets_per_group]
-            groups.append(group)
-
-        return groups
-
-
-def fetch_transactions_for_group(
-    wallet_group: List[str],
-    chain: str = "base",
-    lookback_days: Optional[int] = None,
-) -> List[Dict]:
-    """
-    Fetch all transactions for a group of wallets.
-    This function handles pagination internally.
-
-    Args:
-        wallet_group: List of wallet addresses in this group
-        chain: Blockchain chain (default: "base")
-        lookback_days: Optional number of days to look back
-
-    Returns:
-        List of all transactions for the wallets in this group
-    """
-    return get_all_wallet_transactions(wallet_group, chain, lookback_days)
-
-
 def get_wallet_transactions_page(
     addresses: List[str],
     chain: str = "base",
     cursor: str = None,
-    lookback_days: Optional[int] = None,
 ) -> Dict:
     """
     Fetch one page of wallet transactions from Allium API with unlimited retries and exponential backoff.
@@ -233,20 +176,14 @@ def get_wallet_transactions_page(
         addresses: List of wallet addresses
         chain: Blockchain chain (default: "base")
         cursor: Pagination cursor
-        lookback_days: Optional number of days to look back (default: None, fetches since genesis)
-                       According to Allium API docs: https://docs.allium.so/api/developer/wallets/transactions#parameter-lookback-days
     """
     # Prepare request body with all addresses
     payload = [{"chain": chain, "address": addr} for addr in addresses]
 
     # Prepare query parameters
-    params = {"limit": 1000}
+    params = {"limit": 200}
     if cursor:
         params["cursor"] = cursor
-
-    # Add lookback_days parameter if provided (for last day data)
-    if lookback_days is not None:
-        params["lookback_days"] = lookback_days
 
     # Exponential backoff configuration
     MAX_BACKOFF_SECONDS = 30
@@ -264,7 +201,6 @@ def get_wallet_transactions_page(
                     "attempt": attempt,
                     "address_count": len(addresses),
                     "has_cursor": cursor is not None,
-                    "lookback_days": lookback_days,
                     "retry_delay": current_delay if attempt > 1 else 0,
                 },
             )
@@ -333,16 +269,19 @@ def get_wallet_transactions_page(
 
 
 def get_all_wallet_transactions(
-    addresses: List[str], chain: str = "base", lookback_days: Optional[int] = None
+    addresses: List[str],
+    chain: str = "base",
+    last_processed_timestamp: Optional[datetime] = None,
 ) -> List[Dict]:
     """
-    Fetch wallet transactions using pagination, filtered by lookback_days if provided.
+    Fetch wallet transactions using pagination.
+    Continues fetching pages while the last timestamp from a page is greater than last_processed_timestamp.
+    Data is returned in descending order of timestamp.
 
     Args:
         addresses: List of wallet addresses
         chain: Blockchain chain (default: "base")
-        lookback_days: Optional number of days to look back (default: None, fetches since genesis)
-                       Set to 1 to fetch only last day data
+        last_processed_timestamp: Timestamp to compare against (only fetch while last timestamp > this)
     """
     all_transactions = []
     cursor = None
@@ -352,7 +291,11 @@ def get_all_wallet_transactions(
         "Starting pagination loop for wallet transactions",
         extra={
             "address_count": len(addresses),
-            "lookback_days": lookback_days,
+            "last_processed_timestamp": (
+                last_processed_timestamp.isoformat()
+                if last_processed_timestamp
+                else None
+            ),
         },
     )
 
@@ -368,20 +311,40 @@ def get_all_wallet_transactions(
             },
         )
 
-        # Get one page of results with lookback_days filtering
-        results = get_wallet_transactions_page(addresses, chain, cursor, lookback_days)
+        # Get one page of results
+        results = get_wallet_transactions_page(addresses, chain, cursor)
 
         # Add transactions from this page to our collection
         if "items" in results and results["items"]:
-            all_transactions.extend(results["items"])
+            page_transactions = results["items"]
+            all_transactions.extend(page_transactions)
+
+            # Get the last timestamp from this page (data is in descending order, so last item has oldest timestamp)
+            last_item = page_transactions[-1]
+            last_timestamp_str = last_item.get("block_timestamp")
+            last_timestamp = parse_allium_timestamp(last_timestamp_str)
+
             logger.info(
                 "Received transaction page",
                 extra={
                     "page": page_count,
-                    "items_on_page": len(results["items"]),
+                    "items_on_page": len(page_transactions),
                     "total_accumulated": len(all_transactions),
+                    "last_timestamp_on_page": last_timestamp_str,
                 },
             )
+
+            # If we have a last_processed_timestamp, check if we should continue
+            if last_processed_timestamp and last_timestamp:
+                if last_timestamp <= last_processed_timestamp:
+                    logger.info(
+                        "Last timestamp on page is <= last_processed_timestamp, stopping pagination",
+                        extra={
+                            "last_timestamp": last_timestamp.isoformat(),
+                            "last_processed_timestamp": last_processed_timestamp.isoformat(),
+                        },
+                    )
+                    break
         else:
             logger.info(
                 "No transactions found on this page", extra={"page": page_count}
@@ -403,7 +366,6 @@ def get_all_wallet_transactions(
         extra={
             "total_transactions": len(all_transactions),
             "pages_fetched": page_count,
-            "lookback_days": lookback_days,
         },
     )
     return all_transactions
@@ -531,36 +493,42 @@ def filter_and_transform_native_transfers(
     api_request_time: str,
     wallets_set: Set[str],
     last_processed_timestamp: datetime,
-    upper_bound_timestamp: datetime,
-) -> Tuple[List[tuple[Dict, Set[str]]], datetime]:
+) -> Tuple[List[tuple[Dict, Set[str]]], Optional[datetime]]:
     """
     Filter and transform transactions to only include those with native transfers.
     Uses batch contract checking for performance.
-    Only processes transactions between last_processed_timestamp (exclusive) and upper_bound_timestamp (inclusive).
+    Processes transactions until we encounter one with timestamp <= last_processed_timestamp.
+    Data is in descending order of timestamp.
 
     Args:
-        transactions: List of raw transactions from API
+        transactions: List of raw transactions from API (in descending timestamp order)
         api_request_time: ISO format timestamp when API request was made
         wallets_set: Set of wallet addresses from Supabase (lowercase normalized)
-        last_processed_timestamp: Timestamp to filter transactions (only process after this, exclusive)
-        upper_bound_timestamp: Upper bound timestamp (only process up to this, inclusive)
+        last_processed_timestamp: Timestamp to filter transactions (only process while > this, exclusive)
 
     Returns:
-        Tuple of (list of tuples: (formatted_transaction, wallet_addresses), latest_timestamp)
+        Tuple of (list of tuples: (formatted_transaction, wallet_addresses), first_timestamp)
+        first_timestamp is the timestamp of the first (most recent) record processed, or None if no records
     """
-    # Filter transactions by timestamp range
+    # Process transactions in order until we hit one with timestamp <= last_processed_timestamp
     filtered_transactions = []
     for transaction in transactions:
         block_timestamp = transaction.get("block_timestamp")
         tx_timestamp = parse_allium_timestamp(block_timestamp)
 
         if tx_timestamp:
-            # Only include transactions after last_processed_timestamp and <= upper_bound_timestamp
-            if (
-                tx_timestamp > last_processed_timestamp
-                and tx_timestamp <= upper_bound_timestamp
-            ):
-                filtered_transactions.append(transaction)
+            # Break when we encounter a transaction with timestamp <= last_processed_timestamp
+            if tx_timestamp <= last_processed_timestamp:
+                logger.info(
+                    "Encountered transaction with timestamp <= last_processed_timestamp, stopping processing",
+                    extra={
+                        "tx_timestamp": tx_timestamp.isoformat(),
+                        "last_processed_timestamp": last_processed_timestamp.isoformat(),
+                    },
+                )
+                break
+            # Only include transactions after last_processed_timestamp
+            filtered_transactions.append(transaction)
         else:
             # Include transactions without valid timestamp (to be safe)
             filtered_transactions.append(transaction)
@@ -571,9 +539,11 @@ def filter_and_transform_native_transfers(
             "original_count": len(transactions),
             "filtered_count": len(filtered_transactions),
             "last_processed_timestamp": last_processed_timestamp.isoformat(),
-            "upper_bound_timestamp": upper_bound_timestamp.isoformat(),
         },
     )
+
+    if not filtered_transactions:
+        return [], None
 
     # First, collect all unique addresses from all filtered transactions
     unique_addresses = set()
@@ -594,7 +564,7 @@ def filter_and_transform_native_transfers(
 
     # Now process transactions with pre-computed contract results
     native_transfer_transactions = []
-    latest_timestamp = last_processed_timestamp
+    first_timestamp = None
 
     for transaction in filtered_transactions:
         formatted, wallet_addresses = extract_native_transfers(
@@ -603,15 +573,14 @@ def filter_and_transform_native_transfers(
         if formatted:
             native_transfer_transactions.append((formatted, wallet_addresses))
 
-        # Update latest timestamp for ALL processed transactions (not just those with native transfers)
-        # This ensures we don't reprocess the same transactions when no native transfers are found
-        block_timestamp = transaction.get("block_timestamp")
-        tx_timestamp = parse_allium_timestamp(block_timestamp)
+        # Get the first (most recent) timestamp from the first transaction
+        if first_timestamp is None:
+            block_timestamp = transaction.get("block_timestamp")
+            tx_timestamp = parse_allium_timestamp(block_timestamp)
+            if tx_timestamp:
+                first_timestamp = tx_timestamp
 
-        if tx_timestamp and tx_timestamp > latest_timestamp:
-            latest_timestamp = tx_timestamp
-
-    return native_transfer_transactions, latest_timestamp
+    return native_transfer_transactions, first_timestamp
 
 
 def publish_to_sns(transaction: Dict, wallet_addresses: Set[str]) -> None:
@@ -673,7 +642,7 @@ def main():
                 extra={"iteration": iteration, "timestamp": current_time},
             )
 
-            # Get current time at start of iteration (this will be the upper bound for this iteration)
+            # Get current time at start of iteration
             iteration_start_time = datetime.now(timezone.utc)
             api_request_time = iteration_start_time.isoformat()
 
@@ -683,7 +652,6 @@ def main():
                 "Retrieved last processed timestamp",
                 extra={
                     "timestamp": last_processed_timestamp.isoformat(),
-                    "iteration_start_time": iteration_start_time.isoformat(),
                 },
             )
 
@@ -704,79 +672,36 @@ def main():
                 # Convert wallets list to normalized set (lowercase) for efficient lookup
                 wallets_set = {wallet.lower() for wallet in wallets}
 
-                # Split wallets into groups (max 9 groups for rate limiting)
-                wallet_groups = split_wallets_into_groups(wallets, max_groups=9)
+                # Fetch transactions for all wallets in a single call
                 logger.info(
-                    "Split wallets into groups for parallel API calls",
+                    "Starting to fetch transactions from Allium API",
                     extra={
-                        "total_wallets": len(wallets),
-                        "number_of_groups": len(wallet_groups),
-                        "wallets_per_group": [len(group) for group in wallet_groups],
-                    },
-                )
-
-                # Fetch transactions for all groups in parallel (max 9 concurrent calls)
-                logger.info(
-                    "Starting to fetch transactions from Allium API (parallel groups)",
-                    extra={
-                        "group_count": len(wallet_groups),
+                        "wallet_count": len(wallets),
                         "chain": "base",
-                        "lookback_days": 1,
                     },
                 )
 
-                all_transactions = []
-                with ThreadPoolExecutor(max_workers=9) as executor:
-                    # Submit all group fetch tasks
-                    futures = {
-                        executor.submit(
-                            fetch_transactions_for_group,
-                            group,
-                            "base",
-                            1,  # lookback_days
-                        ): group_idx
-                        for group_idx, group in enumerate(wallet_groups)
-                    }
-
-                    # Collect results as they complete
-                    for future in as_completed(futures):
-                        group_idx = futures[future]
-                        try:
-                            group_transactions = future.result()
-                            all_transactions.extend(group_transactions)
-                            logger.info(
-                                "Completed fetching transactions for group",
-                                extra={
-                                    "group_index": group_idx,
-                                    "transactions_in_group": len(group_transactions),
-                                    "total_accumulated": len(all_transactions),
-                                },
-                            )
-                        except Exception as e:
-                            logger.error(
-                                "Error fetching transactions for group",
-                                extra={
-                                    "group_index": group_idx,
-                                    "error": str(e),
-                                    "error_type": type(e).__name__,
-                                },
-                            )
+                # Fetch all transactions, paginating while last timestamp > last_processed_timestamp
+                all_transactions = get_all_wallet_transactions(
+                    wallets,
+                    chain="base",
+                    last_processed_timestamp=last_processed_timestamp,
+                )
 
                 logger.info(
                     "Finished fetching transactions from Allium API",
                     extra={"total_transactions": len(all_transactions)},
                 )
 
-                # Filter and transform to only include native transfers in the timestamp range
-                # Range: last_processed_timestamp < tx_timestamp <= iteration_start_time
+                # Filter and transform to only include native transfers
+                # Process transactions until we encounter one with timestamp <= last_processed_timestamp
                 if all_transactions:
-                    native_transfer_transactions, latest_timestamp = (
+                    native_transfer_transactions, _ = (
                         filter_and_transform_native_transfers(
                             all_transactions,
                             api_request_time,
                             wallets_set,
                             last_processed_timestamp,
-                            iteration_start_time,
                         )
                     )
 
@@ -811,8 +736,6 @@ def main():
                         )
 
                     # Update the last processed timestamp to iteration_start_time
-                    # This is the time we captured at the start of the iteration
-                    # This ensures we don't reprocess transactions from this time window
                     update_last_processed_timestamp(supabase, iteration_start_time)
                     logger.info(
                         "Updated last processed timestamp to iteration start time",
