@@ -853,8 +853,8 @@ def main():
                     "duration_formatted": duration_formatted,
                 },
             )
-            logger.info("Sleeping for 10 seconds before next iteration")
-            time.sleep(10)  # Wait 10 seconds before next iteration
+            logger.info("Sleeping for 60 seconds before next iteration")
+            time.sleep(60)  # Wait 60 seconds before next iteration
 
     except KeyboardInterrupt:
         logger.info("Shutting down service")
