@@ -496,7 +496,7 @@ def filter_and_transform_native_transfers(
 
 
 def publish_to_sns(transaction: Dict, wallet_addresses: Set[str]) -> None:
-    """Publish transaction to SNS topic with wallet addresses as message attributes"""
+    """Publish transaction to SNS topic with event_address array as message attributes"""
     try:
         # Prepare message
         message_body = json.dumps(transaction)
@@ -504,12 +504,14 @@ def publish_to_sns(transaction: Dict, wallet_addresses: Set[str]) -> None:
         # Prepare message attributes
         message_attributes = {}
 
-        # Add wallet addresses as message attribute
-        wallet_addresses_list = list(wallet_addresses)
-        wallet_addresses_json = json.dumps(wallet_addresses_list)
-        message_attributes["wallet_addresses"] = {
+        # Create event_address array with strings in format "NativeTransfer_<address>"
+        event_address_list = [
+            f"NativeTransfer_{address}" for address in wallet_addresses
+        ]
+        event_address_json = json.dumps(event_address_list)
+        message_attributes["event_address"] = {
             "DataType": "String.Array",
-            "StringValue": wallet_addresses_json,
+            "StringValue": event_address_json,
         }
 
         # Publish to SNS using the hardcoded ARN
