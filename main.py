@@ -18,23 +18,28 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from logger import logger
 
 
-# Supabase configuration
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://xfcduaalalfppjfoqwke.supabase.co")
-SUPABASE_KEY = os.getenv(
-    "SUPABASE_ANON_KEY",
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhmY2R1YWFsYWxmcHBqZm9xd2tlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTE4ODg3NjQsImV4cCI6MjA2NzQ2NDc2NH0.f5wyoVkiqO163JRPzjnPn9R3jN-gzqss1PZSJ6PRa2U",
-)
+# Supabase configuration - must be set in .env file
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
-# SNS Configuration
-SNS_TOPIC_ARN = os.getenv(
-    "SNS_TOPIC_ARN", "arn:aws:sns:us-east-1:631447262747:BASE_CONTRACT"
-)
+# Validate required environment variables
+if not SUPABASE_URL:
+    raise ValueError("SUPABASE_URL environment variable is required but not set")
+if not SUPABASE_KEY:
+    raise ValueError(
+        "SUPABASE_SERVICE_ROLE_KEY environment variable is required but not set"
+    )
 
-# Allium API configuration
-ALLIUM_API_KEY = os.getenv(
-    "ALLIUM_API_KEY",
-    "kijnI3_lzTVtPgJ32fe9fsysrs1iWakay-HRlm8EBIzxC43NjaIUjhqvPZGlrBkaQiBmGtFkNM1tzZPDNdtXdQ",
-)
+# SNS Configuration - must be set in .env file
+SNS_TOPIC_ARN = os.getenv("SNS_TOPIC_ARN")
+if not SNS_TOPIC_ARN:
+    raise ValueError("SNS_TOPIC_ARN environment variable is required but not set")
+
+# Allium API configuration - must be set in .env file
+ALLIUM_API_KEY = os.getenv("ALLIUM_API_KEY")
+if not ALLIUM_API_KEY:
+    raise ValueError("ALLIUM_API_KEY environment variable is required but not set")
+
 ALLIUM_BASE_URL = "https://api.allium.so/api/v1/developer/wallet/transactions"
 ALLIUM_HEADERS = {"Content-Type": "application/json", "X-API-KEY": ALLIUM_API_KEY}
 

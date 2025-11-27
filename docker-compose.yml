@@ -12,8 +12,7 @@ services:
         max-file: "3"
     environment:
       - PYTHONUNBUFFERED=1
-    # Uncomment and modify if you want to use environment variables for credentials
-    # env_file:
-    #   - .env
+    env_file:
+      - .env
     # volumes:
     #   - ./data:/app/data  # Uncomment if you want persistent data storage

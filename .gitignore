@@ -1,0 +1,4 @@
+__pycache__/
+allium_verification_results.json
+verify_allium_transfers.py
+.env
