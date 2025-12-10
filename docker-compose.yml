@@ -16,3 +16,21 @@ services:
       - .env
     # volumes:
     #   - ./data:/app/data  # Uncomment if you want persistent data storage
+
+  backfilling-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.backfilling
+    container_name: backfilling-service
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    environment:
+      - PYTHONUNBUFFERED=1
+    env_file:
+      - .env
+    # volumes:
+    #   - ./data:/app/data  # Uncomment if you want persistent data storage
