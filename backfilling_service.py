@@ -495,19 +495,66 @@ def invoke_lambda_with_batch(batch_data, subgraph_id):
             Payload=json.dumps(payload),
         )
 
+        # Check response status
+        status_code = response.get("StatusCode")
+        function_error = response.get("FunctionError")
+
+        if function_error:
+            logger.error(
+                "Lambda function error",
+                extra={
+                    "error": function_error,
+                    "batch_size": len(batch_data),
+                    "subgraph_id": subgraph_id,
+                    "status_code": status_code,
+                },
+            )
+            return False
+
+        # For async invocations, StatusCode should be 202 (Accepted)
+        if status_code != 202:
+            logger.error(
+                "Lambda invocation returned unexpected status code",
+                extra={
+                    "status_code": status_code,
+                    "expected": 202,
+                    "batch_size": len(batch_data),
+                    "subgraph_id": subgraph_id,
+                },
+            )
+            return False
+
         logger.debug(
-            "Lambda invoked",
-            extra={"batch_size": len(batch_data), "subgraph_id": subgraph_id},
+            "Lambda invoked successfully",
+            extra={
+                "batch_size": len(batch_data),
+                "subgraph_id": subgraph_id,
+                "status_code": status_code,
+            },
         )
 
         return True
 
     except ClientError as e:
-        logger.error("Lambda invocation failed", extra={"error": str(e)})
+        logger.error(
+            "Lambda invocation failed (ClientError)",
+            extra={
+                "error": str(e),
+                "error_code": e.response.get("Error", {}).get("Code"),
+                "batch_size": len(batch_data),
+                "subgraph_id": subgraph_id,
+            },
+        )
         return False
     except Exception as e:
         logger.error(
-            "Unexpected error during Lambda invocation", extra={"error": str(e)}
+            "Unexpected error during Lambda invocation",
+            extra={
+                "error": str(e),
+                "error_type": type(e).__name__,
+                "batch_size": len(batch_data),
+                "subgraph_id": subgraph_id,
+            },
         )
         return False
 
