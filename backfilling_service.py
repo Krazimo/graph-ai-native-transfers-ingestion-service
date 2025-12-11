@@ -135,9 +135,14 @@ def build_name_address_filter(subscribers):
         return ""
 
     # Build name-address pairs (lowercase addresses as per Allium convention)
-    name_address_pairs = [
-        (sub["event_type"], sub["contract_address"].lower()) for sub in subscribers
-    ]
+    # Strip 'BASE_CONTRACT.' prefix from event_type if present
+    name_address_pairs = []
+    for sub in subscribers:
+        event_type = sub["event_type"]
+        # Remove 'BASE_CONTRACT.' prefix if present
+        if event_type.startswith("BASE_CONTRACT."):
+            event_type = event_type.replace("BASE_CONTRACT.", "")
+        name_address_pairs.append((event_type, sub["contract_address"].lower()))
 
     # Build the filter string
     name_address_filter = " or ".join(
@@ -168,10 +173,19 @@ def run_allium_query(parameters):
         dict: Query results or None if failed
     """
     run_config = {"limit": ALLIUM_RUN_LIMIT}
+    query_start_time = time.time()
 
     try:
         # Step 1: Start async query
-        logger.info("Starting Allium async query")
+        logger.info(
+            "Starting Allium async query",
+            extra={
+                "query_id": ALLIUM_QUERY_ID,
+                "time_range": f"{parameters.get('param_1')} to {parameters.get('param_10')}",
+                "limit": ALLIUM_RUN_LIMIT,
+            },
+        )
+
         response = requests.post(
             f"https://api.allium.so/api/v1/explorer/queries/{ALLIUM_QUERY_ID}/run-async",
             json={"parameters": parameters, "run_config": run_config},
@@ -182,20 +196,34 @@ def run_allium_query(parameters):
 
         if response.status_code != 200:
             logger.error(
-                "Error starting Allium query", extra={"response": response_data}
+                "Error starting Allium query",
+                extra={
+                    "status_code": response.status_code,
+                    "response": response_data,
+                },
             )
             return None
 
         run_id = response_data.get("run_id")
         if not run_id:
-            logger.error("No run_id in Allium response")
+            logger.error(
+                "No run_id in Allium response", extra={"response": response_data}
+            )
             return None
 
-        logger.info("Allium query started", extra={"run_id": run_id})
+        logger.info(
+            "Allium query submitted successfully",
+            extra={
+                "run_id": run_id,
+                "query_id": ALLIUM_QUERY_ID,
+            },
+        )
 
         # Step 2: Poll for completion
         max_attempts = 120  # 10 minutes with 5s intervals
         attempt = 0
+        poll_start_time = time.time()
+        last_status = None
 
         while attempt < max_attempts:
             attempt += 1
@@ -207,26 +235,70 @@ def run_allium_query(parameters):
             )
 
             status = response.text.strip('"')
-            logger.debug(
-                f"Allium query status check",
-                extra={"attempt": attempt, "status": status},
-            )
+
+            # Log status changes or every 10th attempt
+            if status != last_status or attempt % 10 == 0:
+                elapsed_time = time.time() - poll_start_time
+                logger.info(
+                    "Allium query status check",
+                    extra={
+                        "run_id": run_id,
+                        "attempt": attempt,
+                        "status": status,
+                        "elapsed_seconds": round(elapsed_time, 1),
+                        "max_attempts": max_attempts,
+                    },
+                )
+                last_status = status
 
             if status == "success":
-                logger.info("Allium query completed successfully")
+                poll_duration = time.time() - poll_start_time
+                logger.info(
+                    "Allium query completed successfully",
+                    extra={
+                        "run_id": run_id,
+                        "total_attempts": attempt,
+                        "poll_duration_seconds": round(poll_duration, 1),
+                    },
+                )
                 break
             elif status == "failed":
-                logger.error("Allium query failed")
+                logger.error(
+                    "Allium query failed",
+                    extra={
+                        "run_id": run_id,
+                        "attempt": attempt,
+                        "status": status,
+                    },
+                )
                 return None
             elif status not in ["created", "queued", "running"]:
-                logger.warning("Unknown Allium query status", extra={"status": status})
+                logger.warning(
+                    "Unknown Allium query status",
+                    extra={
+                        "run_id": run_id,
+                        "status": status,
+                        "attempt": attempt,
+                    },
+                )
 
         if attempt >= max_attempts:
-            logger.error("Allium query timed out")
+            timeout_duration = time.time() - poll_start_time
+            logger.error(
+                "Allium query timed out",
+                extra={
+                    "run_id": run_id,
+                    "max_attempts": max_attempts,
+                    "timeout_seconds": round(timeout_duration, 1),
+                    "last_status": last_status,
+                },
+            )
             return None
 
         # Step 3: Get results
-        logger.info("Fetching Allium query results")
+        logger.info("Fetching Allium query results", extra={"run_id": run_id})
+
+        fetch_start_time = time.time()
         response = requests.get(
             f"https://api.allium.so/api/v1/explorer/query-runs/{run_id}/results",
             headers={"X-API-KEY": ALLIUM_API_KEY},
@@ -234,14 +306,41 @@ def run_allium_query(parameters):
 
         if response.status_code != 200:
             logger.error(
-                "Error fetching Allium results", extra={"status": response.status_code}
+                "Error fetching Allium results",
+                extra={
+                    "run_id": run_id,
+                    "status_code": response.status_code,
+                    "response_text": response.text[:500],
+                },
             )
             return None
 
-        return response.json()
+        results = response.json()
+        fetch_duration = time.time() - fetch_start_time
+        total_duration = time.time() - query_start_time
+
+        num_records = len(results.get("data", []))
+        logger.info(
+            "Allium query results fetched",
+            extra={
+                "run_id": run_id,
+                "num_records": num_records,
+                "fetch_duration_seconds": round(fetch_duration, 1),
+                "total_duration_seconds": round(total_duration, 1),
+            },
+        )
+
+        return results
 
     except Exception as e:
-        logger.error("Exception in Allium query", extra={"error": str(e)})
+        logger.error(
+            "Exception in Allium query",
+            extra={
+                "error": str(e),
+                "error_type": type(e).__name__,
+                "parameters": parameters,
+            },
+        )
         return None
 
 
@@ -260,6 +359,7 @@ def fetch_allium_events(start_time, end_time, name_address_filter):
     """
     all_data = []
     batch_num = 1
+    fetch_start_time = time.time()
 
     # Initial parameters
     parameters = {
@@ -268,47 +368,105 @@ def fetch_allium_events(start_time, end_time, name_address_filter):
         "param_name_address_filter": name_address_filter,
     }
 
+    logger.info(
+        "Starting Allium events fetch",
+        extra={
+            "start_time": start_time,
+            "end_time": end_time,
+            "filter_length": len(name_address_filter),
+        },
+    )
+
     while True:
+        batch_start_time = time.time()
+
         logger.info(
             f"Fetching Allium batch {batch_num}",
-            extra={"start": parameters["param_1"], "end": parameters["param_10"]},
+            extra={
+                "batch_num": batch_num,
+                "start": parameters["param_1"],
+                "end": parameters["param_10"],
+                "total_records_so_far": len(all_data),
+            },
         )
 
         results = run_allium_query(parameters)
 
         if results is None:
-            logger.error("Allium query failed, stopping pagination")
+            logger.error(
+                "Allium query failed, stopping pagination",
+                extra={
+                    "batch_num": batch_num,
+                    "records_collected_so_far": len(all_data),
+                },
+            )
             break
 
         batch_data = results.get("data", [])
         num_records = len(batch_data)
+        batch_duration = time.time() - batch_start_time
 
         logger.info(
-            f"Retrieved Allium batch",
-            extra={"batch_num": batch_num, "records": num_records},
+            f"Retrieved Allium batch {batch_num}",
+            extra={
+                "batch_num": batch_num,
+                "records_in_batch": num_records,
+                "total_records": len(all_data) + num_records,
+                "batch_duration_seconds": round(batch_duration, 1),
+            },
         )
 
         all_data.extend(batch_data)
 
         # Check if we hit the limit (meaning there might be more data)
         if num_records >= ALLIUM_RUN_LIMIT:
-            logger.info("Hit Allium limit, fetching next batch")
+            logger.info(
+                "Hit Allium limit, fetching next batch",
+                extra={
+                    "batch_num": batch_num,
+                    "limit": ALLIUM_RUN_LIMIT,
+                    "total_records_so_far": len(all_data),
+                },
+            )
 
             # Get the timestamp of the last record for next query
             last_record = batch_data[-1]
             last_timestamp = last_record.get("block_timestamp")
 
             if not last_timestamp:
-                logger.warning("No block_timestamp in last record, stopping pagination")
+                logger.warning(
+                    "No block_timestamp in last record, stopping pagination",
+                    extra={
+                        "batch_num": batch_num,
+                        "last_record_keys": (
+                            list(last_record.keys()) if last_record else []
+                        ),
+                    },
+                )
                 break
+
+            logger.info(
+                "Continuing pagination with new timestamp",
+                extra={
+                    "batch_num": batch_num,
+                    "next_batch": batch_num + 1,
+                    "new_end_timestamp": last_timestamp,
+                },
+            )
 
             # Update param_10 to the last timestamp for the next query
             parameters["param_10"] = last_timestamp
             batch_num += 1
         else:
+            total_duration = time.time() - fetch_start_time
             logger.info(
-                "All Allium data retrieved",
-                extra={"total_batches": batch_num, "total_records": len(all_data)},
+                "All Allium data retrieved successfully",
+                extra={
+                    "total_batches": batch_num,
+                    "total_records": len(all_data),
+                    "total_duration_seconds": round(total_duration, 1),
+                    "average_batch_time": round(total_duration / batch_num, 1),
+                },
             )
             break
 
@@ -369,23 +527,66 @@ def send_events_to_lambda(events, subgraph_id):
     total_events = len(events)
     total_sent = 0
     total_failed = 0
+    total_batches = (total_events + BATCH_SIZE - 1) // BATCH_SIZE
+    send_start_time = time.time()
+
+    logger.info(
+        "Starting to send events to Lambda",
+        extra={
+            "total_events": total_events,
+            "batch_size": BATCH_SIZE,
+            "total_batches": total_batches,
+            "subgraph_id": subgraph_id,
+        },
+    )
 
     # Process in batches
-    for i in range(0, total_events, BATCH_SIZE):
+    for batch_idx, i in enumerate(range(0, total_events, BATCH_SIZE), start=1):
         batch = events[i : i + BATCH_SIZE]
+        batch_start_time = time.time()
 
         if invoke_lambda_with_batch(batch, subgraph_id):
             total_sent += len(batch)
+            batch_duration = time.time() - batch_start_time
+
+            # Log progress every 10 batches or on first/last batch
+            if batch_idx == 1 or batch_idx == total_batches or batch_idx % 10 == 0:
+                elapsed_time = time.time() - send_start_time
+                progress_pct = (batch_idx / total_batches) * 100
+                logger.info(
+                    f"Lambda batch progress: {batch_idx}/{total_batches}",
+                    extra={
+                        "batch_num": batch_idx,
+                        "total_batches": total_batches,
+                        "progress_percent": round(progress_pct, 1),
+                        "events_sent": total_sent,
+                        "batch_duration_seconds": round(batch_duration, 2),
+                        "elapsed_seconds": round(elapsed_time, 1),
+                    },
+                )
         else:
             total_failed += len(batch)
+            logger.error(
+                f"Lambda batch {batch_idx} failed",
+                extra={
+                    "batch_num": batch_idx,
+                    "batch_size": len(batch),
+                    "total_failed_so_far": total_failed,
+                },
+            )
 
+    total_duration = time.time() - send_start_time
     logger.info(
         "Completed sending events to Lambda",
         extra={
             "total_events": total_events,
             "sent": total_sent,
             "failed": total_failed,
-            "batches": (total_events + BATCH_SIZE - 1) // BATCH_SIZE,
+            "batches": total_batches,
+            "total_duration_seconds": round(total_duration, 1),
+            "average_batch_time": (
+                round(total_duration / total_batches, 2) if total_batches > 0 else 0
+            ),
         },
     )
 
@@ -404,6 +605,7 @@ def process_backfilling_request(request):
     """
     request_id = request["id"]
     subgraph_id = request["subgraph_id"]
+    process_start_time = time.time()
 
     # Handle both old schema (backfilling_window JSONB) and new schema (start_time/end_time columns)
     if "backfilling_window" in request and request["backfilling_window"]:
@@ -417,12 +619,16 @@ def process_backfilling_request(request):
         end_time = request.get("end_time")
 
     logger.info(
-        "Processing backfilling request",
+        "=" * 80,
+    )
+    logger.info(
+        "Starting backfilling request processing",
         extra={
             "request_id": request_id,
             "subgraph_id": subgraph_id,
             "start_time": start_time,
             "end_time": end_time,
+            "status": request.get("status"),
         },
     )
 
@@ -439,9 +645,11 @@ def process_backfilling_request(request):
             return False
 
         # Mark as processing
+        logger.info("Updating status to 'processing'", extra={"request_id": request_id})
         update_backfilling_status(request_id, "processing")
 
         # Get subgraph event subscriptions
+        logger.info("Fetching subgraph subscribers", extra={"subgraph_id": subgraph_id})
         subscribers = get_subgraph_subscribers(subgraph_id)
 
         if not subscribers:
@@ -453,9 +661,20 @@ def process_backfilling_request(request):
             )
             return False
 
-        logger.info("Found subgraph subscribers", extra={"count": len(subscribers)})
+        logger.info(
+            "Found subgraph subscribers",
+            extra={
+                "count": len(subscribers),
+                "subscriber_summary": [
+                    f"{s['event_type']}@{s['contract_address'][:10]}..."
+                    for s in subscribers[:5]
+                ],
+                "total_subscribers": len(subscribers),
+            },
+        )
 
         # Build name-address filter
+        logger.info("Building Allium query filter")
         name_address_filter = build_name_address_filter(subscribers)
 
         if not name_address_filter:
@@ -469,27 +688,57 @@ def process_backfilling_request(request):
 
         # Fetch events from Allium
         logger.info(
-            "Fetching events from Allium",
-            extra={"start": start_time_str, "end": end_time_str},
+            "Phase 1: Fetching events from Allium",
+            extra={
+                "start": start_time_str,
+                "end": end_time_str,
+                "filter_length": len(name_address_filter),
+            },
         )
 
         events = fetch_allium_events(start_time_str, end_time_str, name_address_filter)
 
         if not events:
-            logger.warning("No events found in time window")
+            logger.warning(
+                "No events found in time window",
+                extra={
+                    "start": start_time_str,
+                    "end": end_time_str,
+                },
+            )
             # Mark as completed even with no events (valid result)
             update_backfilling_status(request_id, "completed")
+            logger.info("Request completed with 0 events")
             return True
 
-        logger.info("Fetched events from Allium", extra={"total_events": len(events)})
+        logger.info(
+            "Phase 1 complete: Events fetched from Allium",
+            extra={
+                "total_events": len(events),
+                "first_event_timestamp": (
+                    events[0].get("block_timestamp") if events else None
+                ),
+                "last_event_timestamp": (
+                    events[-1].get("block_timestamp") if events else None
+                ),
+            },
+        )
 
         # Send events to Lambda
+        logger.info(
+            "Phase 2: Sending events to Lambda",
+            extra={"total_events": len(events)},
+        )
         total_sent, total_failed = send_events_to_lambda(events, subgraph_id)
 
         if total_failed > 0:
             logger.warning(
-                "Some events failed to send",
-                extra={"failed": total_failed, "sent": total_sent},
+                "Some events failed to send to Lambda",
+                extra={
+                    "failed": total_failed,
+                    "sent": total_sent,
+                    "failure_rate": f"{(total_failed / len(events) * 100):.1f}%",
+                },
             )
             update_backfilling_status(
                 request_id,
@@ -500,17 +749,35 @@ def process_backfilling_request(request):
 
         # Mark as completed
         update_backfilling_status(request_id, "completed")
+
+        total_duration = time.time() - process_start_time
         logger.info(
             "Backfilling request completed successfully",
-            extra={"request_id": request_id, "events_processed": total_sent},
+            extra={
+                "request_id": request_id,
+                "events_processed": total_sent,
+                "total_duration_seconds": round(total_duration, 1),
+                "events_per_second": (
+                    round(total_sent / total_duration, 2) if total_duration > 0 else 0
+                ),
+            },
+        )
+        logger.info(
+            "=" * 80,
         )
 
         return True
 
     except Exception as e:
+        total_duration = time.time() - process_start_time
         logger.error(
             "Exception processing backfilling request",
-            extra={"request_id": request_id, "error": str(e)},
+            extra={
+                "request_id": request_id,
+                "error": str(e),
+                "error_type": type(e).__name__,
+                "duration_before_failure": round(total_duration, 1),
+            },
         )
         update_backfilling_status(request_id, "failed", str(e))
         return False
