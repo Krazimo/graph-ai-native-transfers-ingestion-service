@@ -404,18 +404,40 @@ def process_backfilling_request(request):
     """
     request_id = request["id"]
     subgraph_id = request["subgraph_id"]
-    backfilling_window = request["backfilling_window"]
+
+    # Handle both old schema (backfilling_window JSONB) and new schema (start_time/end_time columns)
+    if "backfilling_window" in request and request["backfilling_window"]:
+        # Old schema: JSONB field
+        backfilling_window = request["backfilling_window"]
+        start_time = backfilling_window.get("start_time")
+        end_time = backfilling_window.get("end_time")
+    else:
+        # New schema: separate columns
+        start_time = request.get("start_time")
+        end_time = request.get("end_time")
 
     logger.info(
         "Processing backfilling request",
         extra={
             "request_id": request_id,
             "subgraph_id": subgraph_id,
-            "window": backfilling_window,
+            "start_time": start_time,
+            "end_time": end_time,
         },
     )
 
     try:
+        # Validate time window
+        if not start_time or not end_time:
+            logger.error(
+                "Invalid time window",
+                extra={"start_time": start_time, "end_time": end_time},
+            )
+            update_backfilling_status(
+                request_id, "failed", "Missing start_time or end_time"
+            )
+            return False
+
         # Mark as processing
         update_backfilling_status(request_id, "processing")
 
@@ -441,23 +463,17 @@ def process_backfilling_request(request):
             update_backfilling_status(request_id, "failed", "Empty filter")
             return False
 
-        # Extract time window
-        start_time = backfilling_window.get("start_time")
-        end_time = backfilling_window.get("end_time")
-
-        if not start_time or not end_time:
-            logger.error(
-                "Invalid backfilling window", extra={"window": backfilling_window}
-            )
-            update_backfilling_status(request_id, "failed", "Invalid time window")
-            return False
+        # Convert timestamps to ISO format string if they're not already
+        start_time_str = str(start_time) if start_time else None
+        end_time_str = str(end_time) if end_time else None
 
         # Fetch events from Allium
         logger.info(
-            "Fetching events from Allium", extra={"start": start_time, "end": end_time}
+            "Fetching events from Allium",
+            extra={"start": start_time_str, "end": end_time_str},
         )
 
-        events = fetch_allium_events(start_time, end_time, name_address_filter)
+        events = fetch_allium_events(start_time_str, end_time_str, name_address_filter)
 
         if not events:
             logger.warning("No events found in time window")
