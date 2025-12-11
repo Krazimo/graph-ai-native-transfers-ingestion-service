@@ -524,6 +524,8 @@ def invoke_lambda_with_batch(batch_data, subgraph_id):
             )
             return False
 
+        # Log at INFO level for visibility (but only occasionally to avoid log spam)
+        # We'll rely on the batch progress logs in send_events_to_lambda for regular updates
         logger.debug(
             "Lambda invoked successfully",
             extra={
@@ -623,19 +625,37 @@ def send_events_to_lambda(events, subgraph_id):
             )
 
     total_duration = time.time() - send_start_time
-    logger.info(
-        "Completed sending events to Lambda",
-        extra={
-            "total_events": total_events,
-            "sent": total_sent,
-            "failed": total_failed,
-            "batches": total_batches,
-            "total_duration_seconds": round(total_duration, 1),
-            "average_batch_time": (
-                round(total_duration / total_batches, 2) if total_batches > 0 else 0
-            ),
-        },
-    )
+
+    if total_failed == 0:
+        logger.info(
+            "✅ All Lambda invocations successful",
+            extra={
+                "total_events": total_events,
+                "total_batches": total_batches,
+                "sent": total_sent,
+                "failed": 0,
+                "success_rate": "100%",
+                "total_duration_seconds": round(total_duration, 1),
+                "average_batch_time": (
+                    round(total_duration / total_batches, 2) if total_batches > 0 else 0
+                ),
+            },
+        )
+    else:
+        logger.warning(
+            "Completed sending events to Lambda with failures",
+            extra={
+                "total_events": total_events,
+                "sent": total_sent,
+                "failed": total_failed,
+                "batches": total_batches,
+                "success_rate": f"{(total_sent / total_events * 100):.1f}%",
+                "total_duration_seconds": round(total_duration, 1),
+                "average_batch_time": (
+                    round(total_duration / total_batches, 2) if total_batches > 0 else 0
+                ),
+            },
+        )
 
     return total_sent, total_failed
 
