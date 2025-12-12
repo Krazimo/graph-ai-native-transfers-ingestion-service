@@ -264,7 +264,7 @@ def run_allium_query(parameters):
         attempt = 0
         poll_start_time = time.time()
         last_status = None
-        
+
         # Exponential backoff configuration
         initial_delay = 2  # Start with 2 seconds
         max_delay = 30  # Cap at 30 seconds
@@ -294,7 +294,7 @@ def run_allium_query(parameters):
                         "elapsed_seconds": round(elapsed_time, 1),
                         "max_poll_time": max_poll_time,
                     },
-            )
+                )
                 last_status = status
 
             if status == "success":
@@ -327,7 +327,7 @@ def run_allium_query(parameters):
                         "attempt": attempt,
                     },
                 )
-            
+
             # Exponential backoff: double the delay up to max_delay
             current_delay = min(current_delay * 2, max_delay)
 
@@ -676,7 +676,7 @@ def send_events_to_lambda(events, subgraph_id):
     total_duration = time.time() - send_start_time
 
     if total_failed == 0:
-    logger.info(
+        logger.info(
             "✅ All Lambda invocations successful",
             extra={
                 "total_events": total_events,
@@ -693,18 +693,18 @@ def send_events_to_lambda(events, subgraph_id):
     else:
         logger.warning(
             "Completed sending events to Lambda with failures",
-        extra={
-            "total_events": total_events,
-            "sent": total_sent,
-            "failed": total_failed,
+            extra={
+                "total_events": total_events,
+                "sent": total_sent,
+                "failed": total_failed,
                 "batches": total_batches,
                 "success_rate": f"{(total_sent / total_events * 100):.1f}%",
                 "total_duration_seconds": round(total_duration, 1),
                 "average_batch_time": (
                     round(total_duration / total_batches, 2) if total_batches > 0 else 0
                 ),
-        },
-    )
+            },
+        )
 
     return total_sent, total_failed
 
