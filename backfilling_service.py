@@ -92,6 +92,35 @@ def update_backfilling_status(request_id, status, error_message=None):
         )
 
 
+def update_subgraph_status(subgraph_id, status):
+    """
+    Update the status of a subgraph.
+
+    Args:
+        subgraph_id: UUID of the subgraph
+        status: New status (e.g., 'active')
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        supabase.table("subgraphs").update({"status": status}).eq(
+            "id", subgraph_id
+        ).execute()
+
+        logger.info(
+            "Updated subgraph status",
+            extra={"subgraph_id": subgraph_id, "status": status},
+        )
+        return True
+    except Exception as e:
+        logger.error(
+            "Failed to update subgraph status",
+            extra={"subgraph_id": subgraph_id, "status": status, "error": str(e)},
+        )
+        return False
+
+
 def get_subgraph_subscribers(subgraph_id):
     """
     Get all event subscriptions for a subgraph.
@@ -775,6 +804,14 @@ def process_backfilling_request(request):
             )
             # Mark as completed even with no events (valid result)
             update_backfilling_status(request_id, "completed")
+
+            # Update subgraph status to active even with 0 events
+            logger.info(
+                "Updating subgraph status to active (0 events backfilled)",
+                extra={"subgraph_id": subgraph_id},
+            )
+            update_subgraph_status(subgraph_id, "active")
+
             logger.info("Request completed with 0 events")
             return True
 
@@ -816,6 +853,17 @@ def process_backfilling_request(request):
 
         # Mark as completed
         update_backfilling_status(request_id, "completed")
+
+        # Update subgraph status to active
+        logger.info(
+            "Updating subgraph status to active",
+            extra={"subgraph_id": subgraph_id},
+        )
+        if not update_subgraph_status(subgraph_id, "active"):
+            logger.warning(
+                "Failed to update subgraph status, but backfilling completed successfully",
+                extra={"subgraph_id": subgraph_id},
+            )
 
         total_duration = time.time() - process_start_time
         logger.info(
