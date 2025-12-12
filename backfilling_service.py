@@ -31,7 +31,7 @@ AWS_REGION = "us-east-1"
 LAMBDA_FUNCTION_NAME = "GraphAIEventsIngestionService"
 BATCH_SIZE = 100
 POLLING_INTERVAL = 60  # seconds between request checks
-ALLIUM_RUN_LIMIT = 1000  # records per Allium query
+ALLIUM_RUN_LIMIT = 250000  # records per Allium query
 
 # Initialize clients
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -288,7 +288,7 @@ def run_allium_query(parameters):
                         "elapsed_seconds": round(elapsed_time, 1),
                         "max_attempts": max_attempts,
                     },
-                )
+            )
                 last_status = status
 
             if status == "success":
@@ -667,7 +667,7 @@ def send_events_to_lambda(events, subgraph_id):
     total_duration = time.time() - send_start_time
 
     if total_failed == 0:
-        logger.info(
+    logger.info(
             "✅ All Lambda invocations successful",
             extra={
                 "total_events": total_events,
@@ -684,18 +684,18 @@ def send_events_to_lambda(events, subgraph_id):
     else:
         logger.warning(
             "Completed sending events to Lambda with failures",
-            extra={
-                "total_events": total_events,
-                "sent": total_sent,
-                "failed": total_failed,
+        extra={
+            "total_events": total_events,
+            "sent": total_sent,
+            "failed": total_failed,
                 "batches": total_batches,
                 "success_rate": f"{(total_sent / total_events * 100):.1f}%",
                 "total_duration_seconds": round(total_duration, 1),
                 "average_batch_time": (
                     round(total_duration / total_batches, 2) if total_batches > 0 else 0
                 ),
-            },
-        )
+        },
+    )
 
     return total_sent, total_failed
 
