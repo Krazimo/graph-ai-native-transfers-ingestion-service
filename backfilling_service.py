@@ -104,13 +104,24 @@ def update_subgraph_status(subgraph_id, status):
         bool: True if successful, False otherwise
     """
     try:
-        supabase.table("subgraphs").update({"status": status}).eq(
-            "id", subgraph_id
-        ).execute()
+        from datetime import datetime
+
+        update_data = {"status": status}
+
+        # Set activated_at timestamp when status is being set to 'active'
+        # Use datetime.now() without timezone to match subgraphs table schema (timestamp without time zone)
+        if status == "active":
+            update_data["activated_at"] = datetime.now().isoformat()
+
+        supabase.table("subgraphs").update(update_data).eq("id", subgraph_id).execute()
 
         logger.info(
             "Updated subgraph status",
-            extra={"subgraph_id": subgraph_id, "status": status},
+            extra={
+                "subgraph_id": subgraph_id,
+                "status": status,
+                "activated_at": update_data.get("activated_at"),
+            },
         )
         return True
     except Exception as e:
