@@ -259,15 +259,20 @@ def run_allium_query(parameters):
             },
         )
 
-        # Step 2: Poll for completion
-        max_attempts = 120  # 10 minutes with 5s intervals
+        # Step 2: Poll for completion with exponential backoff
+        max_poll_time = 600  # 10 minutes maximum
         attempt = 0
         poll_start_time = time.time()
         last_status = None
+        
+        # Exponential backoff configuration
+        initial_delay = 2  # Start with 2 seconds
+        max_delay = 30  # Cap at 30 seconds
+        current_delay = initial_delay
 
-        while attempt < max_attempts:
+        while time.time() - poll_start_time < max_poll_time:
             attempt += 1
-            time.sleep(5)
+            time.sleep(current_delay)
 
             response = requests.get(
                 f"https://api.allium.so/api/v1/explorer/query-runs/{run_id}/status",
@@ -276,8 +281,8 @@ def run_allium_query(parameters):
 
             status = response.text.strip('"')
 
-            # Log status changes or every 10th attempt
-            if status != last_status or attempt % 10 == 0:
+            # Log status changes or every 5th attempt
+            if status != last_status or attempt % 5 == 0:
                 elapsed_time = time.time() - poll_start_time
                 logger.info(
                     "Allium query status check",
@@ -285,8 +290,9 @@ def run_allium_query(parameters):
                         "run_id": run_id,
                         "attempt": attempt,
                         "status": status,
+                        "poll_delay_seconds": current_delay,
                         "elapsed_seconds": round(elapsed_time, 1),
-                        "max_attempts": max_attempts,
+                        "max_poll_time": max_poll_time,
                     },
             )
                 last_status = status
@@ -321,14 +327,17 @@ def run_allium_query(parameters):
                         "attempt": attempt,
                     },
                 )
+            
+            # Exponential backoff: double the delay up to max_delay
+            current_delay = min(current_delay * 2, max_delay)
 
-        if attempt >= max_attempts:
+        if time.time() - poll_start_time >= max_poll_time:
             timeout_duration = time.time() - poll_start_time
             logger.error(
                 "Allium query timed out",
                 extra={
                     "run_id": run_id,
-                    "max_attempts": max_attempts,
+                    "total_attempts": attempt,
                     "timeout_seconds": round(timeout_duration, 1),
                     "last_status": last_status,
                 },
