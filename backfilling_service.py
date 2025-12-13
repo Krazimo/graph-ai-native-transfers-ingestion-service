@@ -673,6 +673,10 @@ def send_events_to_lambda(events, subgraph_id):
                 },
             )
 
+        # Wait 5 seconds between Lambda invocations to avoid overwhelming the service
+        if batch_idx < total_batches:  # Don't wait after the last batch
+            time.sleep(5)
+
     total_duration = time.time() - send_start_time
 
     if total_failed == 0:
