@@ -102,7 +102,11 @@ def get_last_processed_timestamp(supabase: Client) -> datetime:
     """
     try:
         response = (
-            supabase.table(TIMESTAMP_TABLE_NAME).select("timestamp").limit(1).execute()
+            supabase.table(TIMESTAMP_TABLE_NAME)
+            .select("timestamp")
+            .order("timestamp", desc=True)  # Get the most recent timestamp
+            .limit(1)
+            .execute()
         )
 
         if response.data and len(response.data) > 0:
@@ -126,7 +130,8 @@ def get_last_processed_timestamp(supabase: Client) -> datetime:
 def update_last_processed_timestamp(supabase: Client, timestamp: datetime) -> None:
     """
     Update the last processed timestamp in Supabase.
-    For a single-row table, deletes all rows and inserts the new timestamp.
+    Uses an atomic-safe approach: INSERT first, then DELETE old records.
+    This ensures we never have an empty table even if one operation fails.
 
     Args:
         supabase: Supabase client instance
@@ -136,16 +141,24 @@ def update_last_processed_timestamp(supabase: Client, timestamp: datetime) -> No
         # Convert to ISO format string with timezone
         timestamp_iso = timestamp.isoformat()
 
-        # For single-row table: delete all existing records and insert new one
-        # This ensures we always have exactly one record
-        # Delete all rows (using a condition that matches all)
-        supabase.table(TIMESTAMP_TABLE_NAME).delete().gte(
-            "timestamp", "1970-01-01T00:00:00+00:00"
-        ).execute()
-        # Insert new record
+        # Atomic-safe approach: INSERT first, then DELETE old records
+        # This ensures we never have an empty table:
+        # - If INSERT fails, the old timestamp is still there
+        # - If DELETE fails after INSERT, we have multiple rows but
+        #   get_last_processed_timestamp uses limit(1) so it still works
+        # - On the next successful update, old rows get cleaned up
+
+        # Step 1: Insert the new timestamp first
         supabase.table(TIMESTAMP_TABLE_NAME).insert(
             {"timestamp": timestamp_iso}
         ).execute()
+
+        # Step 2: Delete old timestamps (not equal to the new one)
+        # If this fails, we still have the new timestamp in the table
+        supabase.table(TIMESTAMP_TABLE_NAME).delete().neq(
+            "timestamp", timestamp_iso
+        ).execute()
+
         logger.info(
             "Updated last processed timestamp", extra={"timestamp": timestamp_iso}
         )
